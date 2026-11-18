@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  AlertTriangle,
   ArrowRight,
   Award,
   Bath,
@@ -10,11 +11,15 @@ import {
   ChevronRight,
   Compass,
   Edit3,
+  Eye,
+  EyeOff,
   FileCheck2,
   Home,
   ImagePlus,
   KeyRound,
   Landmark,
+  Lock,
+  LogOut,
   Mail,
   MapPin,
   Maximize2,
@@ -34,6 +39,19 @@ import {
 } from 'lucide-react';
 
 const STORAGE_KEY = 'montanes_propiedades_catalog_v1';
+const CUSTOM_HASH_KEY = 'montanes_owner_custom_hash_v1';
+const AUTH_LOCK_KEY = 'montanes_auth_lock_v1';
+const AUTH_SALT = 'montanes_salt_v1:';
+const OWNER_DEFAULT_HASHES = [
+  'df61c5fd7b8becc40f7e5a0ed82c7a8b8ed4200374e60349db477811cff77b13',
+  'a8cb9a1fab2bdb590d0e29e88df5edce47ea6d1d235adf01178c46e4e46a7544',
+  '2fdf3034e079364174e997e7836d7e029db9dfd749dd3d9680d4b8530ac24a6d',
+];
+const MAX_AUTH_ATTEMPTS = 5;
+const LOCKOUT_MS = 60 * 1000;
+const INACTIVITY_TIMEOUT_MS = 15 * 60 * 1000;
+const MAX_IMAGE_BYTES = 2.5 * 1024 * 1024;
+const ALLOWED_IMAGE_MIME = ['image/jpeg', 'image/png', 'image/webp'];
 
 const FONT_STACK =
   '-apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Inter", "Helvetica Neue", Arial, sans-serif';
@@ -301,12 +319,110 @@ function matchesCategoryFilter(item, filterCategory) {
   return item.category === filterCategory;
 }
 
+function sanitizeText(value, maxLen = 600) {
+  return String(value ?? '')
+    .replace(/[<>]/g, '')
+    .replace(/[\u0000-\u001F\u007F]/g, ' ')
+    .trim()
+    .slice(0, maxLen);
+}
+
+function sanitizeImageUrl(url) {
+  const trimmed = String(url ?? '').trim();
+  if (!trimmed) return DEFAULT_FALLBACK_IMAGE;
+  if (/^data:image\/(jpeg|jpg|png|webp|gif);base64,[A-Za-z0-9+/=]+$/i.test(trimmed)) {
+    return trimmed;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol === 'https:') {
+      return parsed.href;
+    }
+  } catch {
+    // URL inválida
+  }
+  return DEFAULT_FALLBACK_IMAGE;
+}
+
+function sanitizePropertyRecord(item) {
+  if (!item || typeof item !== 'object') return null;
+  const price = Number(item.price);
+  if (!Number.isFinite(price) || price <= 0) return null;
+
+  const toNullablePositiveInt = (val) => {
+    if (val === '' || val === null || val === undefined) return null;
+    const n = Number(val);
+    return Number.isFinite(n) && n >= 0 ? Math.round(n) : null;
+  };
+
+  const title = sanitizeText(item.title, 140);
+  const ref = sanitizeText(item.ref, 24);
+  if (!title || !ref) return null;
+
+  const validOps = ['Venta', 'Alquiler'];
+  const validCats = ['Casa', 'Apartamento', 'Terrenos/Desarrollo'];
+  const validZones = ZONES.filter((z) => z !== 'Todas');
+
+  return {
+    id: sanitizeText(item.id, 64) || `ref-${ref}`,
+    ref,
+    title,
+    operation: validOps.includes(item.operation) ? item.operation : 'Venta',
+    category: validCats.includes(item.category) ? item.category : 'Casa',
+    isDevelopment: Boolean(item.isDevelopment),
+    zone: validZones.includes(item.zone) ? item.zone : 'Centro Maldonado',
+    location: sanitizeText(item.location, 80) || 'Maldonado',
+    price: Math.round(price),
+    bedrooms: toNullablePositiveInt(item.bedrooms),
+    bathrooms: toNullablePositiveInt(item.bathrooms),
+    area: toNullablePositiveInt(item.area),
+    customSpecs: sanitizeText(item.customSpecs, 48),
+    description: sanitizeText(item.description, 600),
+    image: sanitizeImageUrl(item.image),
+  };
+}
+
+async function computeSaltedHash(secret) {
+  const data = new TextEncoder().encode(AUTH_SALT + secret);
+  if (window.crypto?.subtle?.digest) {
+    const digest = await window.crypto.subtle.digest('SHA-256', data);
+    return Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+  }
+  return '';
+}
+
+function getLockState() {
+  try {
+    const raw = window.sessionStorage.getItem(AUTH_LOCK_KEY);
+    if (!raw) return { attempts: 0, lockedUntil: 0 };
+    const parsed = JSON.parse(raw);
+    return {
+      attempts: Number(parsed.attempts) || 0,
+      lockedUntil: Number(parsed.lockedUntil) || 0,
+    };
+  } catch {
+    return { attempts: 0, lockedUntil: 0 };
+  }
+}
+
+function saveLockState(next) {
+  try {
+    window.sessionStorage.setItem(AUTH_LOCK_KEY, JSON.stringify(next));
+  } catch {
+    // noop
+  }
+}
+
 function loadCatalogFromStorage() {
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
     if (!raw) return INITIAL_PROPERTIES;
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) && parsed.length > 0 ? parsed : INITIAL_PROPERTIES;
+    if (!Array.isArray(parsed) || parsed.length === 0) return INITIAL_PROPERTIES;
+    const sanitized = parsed.map(sanitizePropertyRecord).filter(Boolean);
+    return sanitized.length > 0 ? sanitized : INITIAL_PROPERTIES;
   } catch {
     return INITIAL_PROPERTIES;
   }
@@ -368,6 +484,21 @@ export default function MontanesPropiedades() {
   const [confirmResetOpen, setConfirmResetOpen] = useState(false);
   const [toastMessage, setToastMessage] = useState('');
 
+  // Seguridad y autenticación del Área de Propietarios
+  const [authModalOpen, setAuthModalOpen] = useState(false);
+  const [authPassword, setAuthPassword] = useState('');
+  const [showAuthPassword, setShowAuthPassword] = useState(false);
+  const [authError, setAuthError] = useState('');
+  const [authBusy, setAuthBusy] = useState(false);
+  const [lockInfo, setLockInfo] = useState(getLockState);
+  const [lockSecondsLeft, setLockSecondsLeft] = useState(0);
+
+  // Cambio de clave del propietario
+  const [changeKeyOpen, setChangeKeyOpen] = useState(false);
+  const [newKeyInput, setNewKeyInput] = useState('');
+  const [confirmKeyInput, setConfirmKeyInput] = useState('');
+  const [changeKeyError, setChangeKeyError] = useState('');
+
   // Formulario de contacto
   const [contactValues, setContactValues] = useState({
     nombre: '',
@@ -394,7 +525,9 @@ export default function MontanesPropiedades() {
 
   // Cierre con Escape para los modales abiertos
   useEffect(() => {
-    const hasModal = Boolean(detailProperty || editorState || deleteTarget || confirmResetOpen);
+    const hasModal = Boolean(
+      detailProperty || editorState || deleteTarget || confirmResetOpen || authModalOpen || changeKeyOpen
+    );
     if (!hasModal) return undefined;
 
     const prevOverflow = document.body.style.overflow;
@@ -404,6 +537,8 @@ export default function MontanesPropiedades() {
       if (e.key !== 'Escape') return;
       if (deleteTarget) setDeleteTarget(null);
       else if (confirmResetOpen) setConfirmResetOpen(false);
+      else if (changeKeyOpen) setChangeKeyOpen(false);
+      else if (authModalOpen) setAuthModalOpen(false);
       else if (editorState) setEditorState(null);
       else if (detailProperty) setDetailProperty(null);
     };
@@ -413,7 +548,53 @@ export default function MontanesPropiedades() {
       window.removeEventListener('keydown', onKeyDown);
       document.body.style.overflow = prevOverflow;
     };
-  }, [detailProperty, editorState, deleteTarget, confirmResetOpen]);
+  }, [detailProperty, editorState, deleteTarget, confirmResetOpen, authModalOpen, changeKeyOpen]);
+
+  // Contador regresivo del bloqueo por intentos fallidos
+  useEffect(() => {
+    const updateRemaining = () => {
+      const diff = Math.max(0, Math.ceil((lockInfo.lockedUntil - Date.now()) / 1000));
+      setLockSecondsLeft(diff);
+      if (diff === 0 && lockInfo.lockedUntil > 0) {
+        const cleared = { attempts: 0, lockedUntil: 0 };
+        setLockInfo(cleared);
+        saveLockState(cleared);
+      }
+    };
+    updateRemaining();
+    if (lockInfo.lockedUntil <= Date.now()) return undefined;
+    const id = window.setInterval(updateRemaining, 500);
+    return () => window.clearInterval(id);
+  }, [lockInfo]);
+
+  // Cierre automático de sesión por inactividad (15 minutos)
+  useEffect(() => {
+    if (!ownerMode) return undefined;
+    let timerId = null;
+
+    const lockSession = () => {
+      setOwnerMode(false);
+      setEditorState(null);
+      setDeleteTarget(null);
+      setConfirmResetOpen(false);
+      setChangeKeyOpen(false);
+      showToast('Sesión de propietario bloqueada automáticamente por inactividad.');
+    };
+
+    const resetTimer = () => {
+      if (timerId) window.clearTimeout(timerId);
+      timerId = window.setTimeout(lockSession, INACTIVITY_TIMEOUT_MS);
+    };
+
+    const events = ['pointerdown', 'keydown', 'scroll'];
+    events.forEach((ev) => window.addEventListener(ev, resetTimer, { passive: true }));
+    resetTimer();
+
+    return () => {
+      if (timerId) window.clearTimeout(timerId);
+      events.forEach((ev) => window.removeEventListener(ev, resetTimer));
+    };
+  }, [ownerMode]);
 
   useEffect(() => {
     return () => {
@@ -463,8 +644,104 @@ export default function MontanesPropiedades() {
     setSortOrder('featured');
   };
 
-  // Acciones del Área de Propietarios
+  // Acciones de seguridad y del Área de Propietarios
+  const handleToggleOwnerArea = () => {
+    if (ownerMode) {
+      setOwnerMode(false);
+      setEditorState(null);
+      setDeleteTarget(null);
+      setConfirmResetOpen(false);
+      setChangeKeyOpen(false);
+      showToast('Área de Propietarios bloqueada. Sesión cerrada.');
+      return;
+    }
+    setAuthPassword('');
+    setAuthError('');
+    setShowAuthPassword(false);
+    setAuthModalOpen(true);
+  };
+
+  const handleAuthSubmit = async (e) => {
+    e.preventDefault();
+    if (lockSecondsLeft > 0 || authBusy) return;
+    const candidate = authPassword.trim();
+    if (!candidate) {
+      setAuthError('Ingresá la clave de propietario.');
+      return;
+    }
+
+    setAuthBusy(true);
+    try {
+      const digest = await computeSaltedHash(candidate);
+      let customHash = '';
+      try {
+        customHash = window.localStorage.getItem(CUSTOM_HASH_KEY) || '';
+      } catch {
+        customHash = '';
+      }
+      const allowedHashes = customHash ? [customHash] : OWNER_DEFAULT_HASHES;
+
+      if (digest && allowedHashes.includes(digest)) {
+        const reset = { attempts: 0, lockedUntil: 0 };
+        setLockInfo(reset);
+        saveLockState(reset);
+        setAuthModalOpen(false);
+        setAuthPassword('');
+        setAuthError('');
+        setOwnerMode(true);
+        showToast('Acceso verificado. Área de Propietarios desbloqueada.');
+      } else {
+        const nextAttempts = lockInfo.attempts + 1;
+        if (nextAttempts >= MAX_AUTH_ATTEMPTS) {
+          const locked = { attempts: nextAttempts, lockedUntil: Date.now() + LOCKOUT_MS };
+          setLockInfo(locked);
+          saveLockState(locked);
+          setAuthError('Demasiados intentos fallidos. Acceso bloqueado por 60 segundos.');
+        } else {
+          const next = { attempts: nextAttempts, lockedUntil: 0 };
+          setLockInfo(next);
+          saveLockState(next);
+          setAuthError(
+            `Clave incorrecta. Te quedan ${MAX_AUTH_ATTEMPTS - nextAttempts} intento(s).`
+          );
+        }
+      }
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  const handleSaveNewOwnerKey = async (e) => {
+    e.preventDefault();
+    if (!ownerMode) return;
+    const nextKey = newKeyInput.trim();
+    if (nextKey.length < 4) {
+      setChangeKeyError('La nueva clave debe tener al menos 4 caracteres.');
+      return;
+    }
+    if (nextKey !== confirmKeyInput.trim()) {
+      setChangeKeyError('Las claves ingresadas no coinciden.');
+      return;
+    }
+    const newHash = await computeSaltedHash(nextKey);
+    if (!newHash) {
+      setChangeKeyError('Tu navegador no soporta Web Crypto en este contexto.');
+      return;
+    }
+    try {
+      window.localStorage.setItem(CUSTOM_HASH_KEY, newHash);
+      setChangeKeyOpen(false);
+      setNewKeyInput('');
+      setConfirmKeyInput('');
+      setChangeKeyError('');
+      showToast('Clave de propietario actualizada de forma segura.');
+    } catch {
+      setChangeKeyError('No se pudo guardar la nueva clave en este navegador.');
+    }
+  };
+
   const openCreateModal = () => {
+    if (!ownerMode) return;
     const nextRef = String(10700 + properties.length + Math.floor(Math.random() * 90));
     setEditorState({
       mode: 'create',
@@ -476,6 +753,7 @@ export default function MontanesPropiedades() {
   };
 
   const openEditModal = (property) => {
+    if (!ownerMode) return;
     setDetailProperty(null);
     setEditorState({
       mode: 'edit',
@@ -503,17 +781,25 @@ export default function MontanesPropiedades() {
   };
 
   const handleImageFileUpload = (e) => {
+    if (!ownerMode) return;
     const file = e.target.files?.[0];
     if (!file) return;
-    if (!file.type.startsWith('image/')) {
-      showToast('Selecciona un archivo de imagen válido (JPG, PNG o WebP).');
+    if (!ALLOWED_IMAGE_MIME.includes(file.type)) {
+      showToast('Solo se permiten imágenes JPG, PNG o WebP (SVG bloqueado por seguridad).');
+      e.target.value = '';
+      return;
+    }
+    if (file.size > MAX_IMAGE_BYTES) {
+      showToast('La imagen supera los 2.5 MB permitidos. Elegí una más liviana.');
+      e.target.value = '';
       return;
     }
 
     const reader = new FileReader();
     reader.onload = () => {
       if (typeof reader.result === 'string') {
-        updateDraft('image', reader.result);
+        const safeImg = sanitizeImageUrl(reader.result);
+        updateDraft('image', safeImg);
         showToast('Fotografía cargada en la vista previa.');
       }
     };
@@ -523,11 +809,11 @@ export default function MontanesPropiedades() {
 
   const handleSaveProperty = (e) => {
     e.preventDefault();
-    if (!editorState) return;
+    if (!ownerMode || !editorState) return;
     const { mode, draft } = editorState;
 
-    const cleanTitle = draft.title.trim();
-    const cleanRef = draft.ref.trim() || String(Date.now()).slice(-5);
+    const cleanTitle = sanitizeText(draft.title, 140);
+    const cleanRef = sanitizeText(draft.ref, 24) || String(Date.now()).slice(-5);
     const parsedPrice = Number(String(draft.price).replace(/\D/g, ''));
 
     if (!cleanTitle || !Number.isFinite(parsedPrice) || parsedPrice <= 0) {
@@ -538,10 +824,10 @@ export default function MontanesPropiedades() {
     const toNullableNum = (val) => {
       if (val === '' || val === null || val === undefined) return null;
       const n = Number(val);
-      return Number.isFinite(n) && n >= 0 ? n : null;
+      return Number.isFinite(n) && n >= 0 ? Math.round(n) : null;
     };
 
-    const normalizedProperty = {
+    const normalizedProperty = sanitizePropertyRecord({
       id: mode === 'edit' && draft.id ? draft.id : `ref-${cleanRef}-${Date.now()}`,
       ref: cleanRef,
       title: cleanTitle,
@@ -550,17 +836,22 @@ export default function MontanesPropiedades() {
       isDevelopment:
         draft.category === 'Terrenos/Desarrollo' ? true : Boolean(draft.isDevelopment),
       zone: draft.zone || 'Centro Maldonado',
-      location: draft.location.trim() || draft.zone || 'Maldonado',
+      location: sanitizeText(draft.location, 80) || draft.zone || 'Maldonado',
       price: parsedPrice,
       bedrooms: toNullableNum(draft.bedrooms),
       bathrooms: toNullableNum(draft.bathrooms),
       area: toNullableNum(draft.area),
-      customSpecs: draft.customSpecs.trim(),
+      customSpecs: sanitizeText(draft.customSpecs, 48),
       description:
-        draft.description.trim() ||
+        sanitizeText(draft.description, 600) ||
         'Propiedad seleccionada por Montañés Propiedades en Maldonado.',
-      image: draft.image.trim() || DEFAULT_FALLBACK_IMAGE,
-    };
+      image: sanitizeImageUrl(draft.image),
+    });
+
+    if (!normalizedProperty) {
+      showToast('Verificá los datos ingresados antes de guardar.');
+      return;
+    }
 
     if (mode === 'create') {
       setProperties((prev) => [normalizedProperty, ...prev]);
@@ -575,7 +866,7 @@ export default function MontanesPropiedades() {
   };
 
   const confirmDeleteProperty = () => {
-    if (!deleteTarget) return;
+    if (!ownerMode || !deleteTarget) return;
     setProperties((prev) => prev.filter((item) => item.id !== deleteTarget.id));
     if (detailProperty?.id === deleteTarget.id) setDetailProperty(null);
     showToast(`Propiedad Ref. ${deleteTarget.ref} eliminada del catálogo.`);
@@ -583,6 +874,7 @@ export default function MontanesPropiedades() {
   };
 
   const handleRestoreCatalog = () => {
+    if (!ownerMode) return;
     setProperties(INITIAL_PROPERTIES);
     try {
       window.localStorage.removeItem(STORAGE_KEY);
@@ -695,15 +987,7 @@ export default function MontanesPropiedades() {
             <div className="flex items-center gap-1.5 sm:gap-2">
               <button
                 type="button"
-                onClick={() => {
-                  const next = !ownerMode;
-                  setOwnerMode(next);
-                  showToast(
-                    next
-                      ? 'Área de Propietarios activa: ya podés editar, agregar o quitar fichas.'
-                      : 'Modo visitante restaurado.'
-                  );
-                }}
+                onClick={handleToggleOwnerArea}
                 aria-pressed={ownerMode}
                 className={`inline-flex min-h-[38px] items-center gap-1.5 rounded-full px-3 py-1.5 text-[12px] font-semibold transition-all duration-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-[#0066CC] sm:px-3.5 sm:text-[13px] ${
                   ownerMode
@@ -711,15 +995,19 @@ export default function MontanesPropiedades() {
                     : 'border border-white/60 bg-white/75 text-[#1D1D1F] shadow-sm hover:bg-white'
                 }`}
               >
-                <Edit3 className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                {ownerMode ? (
+                  <LogOut className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                ) : (
+                  <Lock className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                )}
                 <span className="hidden sm:inline">Área de Propietarios</span>
-                <span className="sm:hidden">{ownerMode ? 'Editando' : 'Propietarios'}</span>
+                <span className="sm:hidden">{ownerMode ? 'Bloquear' : 'Propietarios'}</span>
                 <span
                   className={`hidden md:inline-block rounded-full px-1.5 py-0.5 text-[10px] font-semibold ${
                     ownerMode ? 'bg-white/20 text-white' : 'bg-[#1D1D1F]/5 text-[#6E6E73]'
                   }`}
                 >
-                  {ownerMode ? 'ON' : 'Editar'}
+                  {ownerMode ? 'Activa' : 'Acceso'}
                 </span>
               </button>
 
@@ -810,11 +1098,32 @@ export default function MontanesPropiedades() {
               </button>
               <button
                 type="button"
+                onClick={() => {
+                  setChangeKeyError('');
+                  setNewKeyInput('');
+                  setConfirmKeyInput('');
+                  setChangeKeyOpen(true);
+                }}
+                className="inline-flex min-h-[38px] items-center gap-1.5 rounded-full border border-white/25 bg-white/10 px-3.5 py-1.5 text-[13px] font-medium text-white transition-colors hover:bg-white/20"
+              >
+                <KeyRound className="h-3.5 w-3.5" aria-hidden="true" />
+                <span>Cambiar clave</span>
+              </button>
+              <button
+                type="button"
                 onClick={() => setConfirmResetOpen(true)}
                 className="inline-flex min-h-[38px] items-center gap-1.5 rounded-full border border-white/25 bg-white/10 px-3.5 py-1.5 text-[13px] font-medium text-white transition-colors hover:bg-white/20"
               >
                 <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
-                <span>Restaurar catálogo original</span>
+                <span>Restaurar original</span>
+              </button>
+              <button
+                type="button"
+                onClick={handleToggleOwnerArea}
+                className="inline-flex min-h-[38px] items-center gap-1.5 rounded-full border border-red-400/40 bg-red-500/20 px-3.5 py-1.5 text-[13px] font-medium text-red-100 transition-colors hover:bg-red-500/35"
+              >
+                <LogOut className="h-3.5 w-3.5" aria-hidden="true" />
+                <span>Bloquear</span>
               </button>
             </div>
           </div>
@@ -1621,13 +1930,17 @@ export default function MontanesPropiedades() {
           </button>
           <button
             type="button"
-            onClick={() => setOwnerMode((prev) => !prev)}
+            onClick={handleToggleOwnerArea}
             className={`inline-flex min-h-[40px] flex-1 items-center justify-center gap-1.5 rounded-full px-3 text-[12px] font-semibold ${
               ownerMode ? 'bg-[#0066CC] text-white' : 'bg-white/80 text-[#1D1D1F]'
             }`}
           >
-            <Edit3 className="h-3.5 w-3.5" aria-hidden="true" />
-            <span>{ownerMode ? 'Modo Edición' : 'Propietarios'}</span>
+            {ownerMode ? (
+              <LogOut className="h-3.5 w-3.5" aria-hidden="true" />
+            ) : (
+              <Lock className="h-3.5 w-3.5" aria-hidden="true" />
+            )}
+            <span>{ownerMode ? 'Bloquear' : 'Propietarios'}</span>
           </button>
           <a
             href={OFFICE_INFO.whatsappHref}
@@ -1765,14 +2078,16 @@ export default function MontanesPropiedades() {
 
               <div className="mt-7 flex flex-col gap-3 border-t border-black/[0.08] pt-5 sm:flex-row sm:items-center sm:justify-between">
                 <div className="flex flex-wrap gap-2">
-                  <button
-                    type="button"
-                    onClick={() => openEditModal(detailProperty)}
-                    className="inline-flex min-h-[44px] items-center justify-center gap-1.5 rounded-full border border-black/15 bg-white px-4 text-[13px] font-semibold text-[#1D1D1F] transition-colors hover:bg-[#F5F5F7]"
-                  >
-                    <Pencil className="h-3.5 w-3.5 text-[#0066CC]" aria-hidden="true" />
-                    <span>Editar esta ficha</span>
-                  </button>
+                  {ownerMode && (
+                    <button
+                      type="button"
+                      onClick={() => openEditModal(detailProperty)}
+                      className="inline-flex min-h-[44px] items-center justify-center gap-1.5 rounded-full border border-black/15 bg-white px-4 text-[13px] font-semibold text-[#1D1D1F] transition-colors hover:bg-[#F5F5F7]"
+                    >
+                      <Pencil className="h-3.5 w-3.5 text-[#0066CC]" aria-hidden="true" />
+                      <span>Editar esta ficha</span>
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={() => openContactForProperty(detailProperty)}
@@ -1800,7 +2115,7 @@ export default function MontanesPropiedades() {
       )}
 
       {/* Modal 2: Editor / Creador de Propiedad ("Área de Propietarios") */}
-      {editorState && (
+      {ownerMode && editorState && (
         <div
           className="fixed inset-0 z-50 flex items-end justify-center bg-black/50 p-0 backdrop-blur-md sm:items-center sm:p-6"
           onClick={() => setEditorState(null)}
@@ -1866,7 +2181,7 @@ export default function MontanesPropiedades() {
                       <input
                         ref={fileInputRef}
                         type="file"
-                        accept="image/*"
+                        accept="image/jpeg,image/png,image/webp"
                         onChange={handleImageFileUpload}
                         className="sr-only"
                       />
@@ -2105,7 +2420,7 @@ export default function MontanesPropiedades() {
       )}
 
       {/* Modal 3: Confirmar eliminación */}
-      {deleteTarget && (
+      {ownerMode && deleteTarget && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm"
           onClick={() => setDeleteTarget(null)}
@@ -2148,7 +2463,7 @@ export default function MontanesPropiedades() {
       )}
 
       {/* Modal 4: Confirmar restauración del catálogo original */}
-      {confirmResetOpen && (
+      {ownerMode && confirmResetOpen && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm"
           onClick={() => setConfirmResetOpen(false)}
@@ -2186,6 +2501,227 @@ export default function MontanesPropiedades() {
                 Restaurar catálogo
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal 5: Autenticación Segura del Área de Propietarios */}
+      {authModalOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-md"
+          onClick={() => setAuthModalOpen(false)}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="auth-dialog-title"
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-md rounded-[32px] border border-white/60 bg-white/90 p-6 shadow-[0_28px_80px_rgba(0,0,0,0.32)] backdrop-blur-2xl sm:p-7"
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-center gap-3">
+                <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-[#0066CC]/10 text-[#0066CC]">
+                  <Lock className="h-5 w-5" aria-hidden="true" />
+                </span>
+                <div>
+                  <p className="text-[11px] font-semibold uppercase tracking-wider text-[#0066CC]">
+                    Acceso Protegido
+                  </p>
+                  <h3
+                    id="auth-dialog-title"
+                    className="text-[20px] font-semibold tracking-tight text-[#1D1D1F]"
+                  >
+                    Área de Propietarios
+                  </h3>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setAuthModalOpen(false)}
+                aria-label="Cerrar acceso de propietarios"
+                className="flex h-9 w-9 items-center justify-center rounded-full bg-black/5 text-[#1D1D1F] hover:bg-black/10"
+              >
+                <X className="h-4 w-4" aria-hidden="true" />
+              </button>
+            </div>
+
+            <p className="mt-3 text-[13px] leading-relaxed text-[#6E6E73]">
+              Ingresá la clave de administración de Montañés Propiedades para habilitar la edición,
+              carga o eliminación de fichas.
+            </p>
+
+            <form onSubmit={handleAuthSubmit} className="mt-5 space-y-4">
+              <div>
+                <label
+                  htmlFor="owner-auth-password"
+                  className="mb-1.5 block text-[12px] font-semibold text-[#1D1D1F]"
+                >
+                  Clave de propietario
+                </label>
+                <div className="relative">
+                  <input
+                    id="owner-auth-password"
+                    type={showAuthPassword ? 'text' : 'password'}
+                    autoComplete="current-password"
+                    autoFocus
+                    disabled={lockSecondsLeft > 0 || authBusy}
+                    value={authPassword}
+                    onChange={(e) => {
+                      setAuthPassword(e.target.value);
+                      if (authError) setAuthError('');
+                    }}
+                    placeholder="Ingresá tu clave..."
+                    className="min-h-[46px] w-full rounded-2xl border border-black/15 bg-white pl-4 pr-11 text-[14px] text-[#1D1D1F] focus:border-[#0066CC] focus:outline-none disabled:bg-black/5"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowAuthPassword((prev) => !prev)}
+                    aria-label={showAuthPassword ? 'Ocultar clave' : 'Mostrar clave'}
+                    className="absolute right-3 top-1/2 flex h-8 w-8 -translate-y-1/2 items-center justify-center rounded-full text-[#6E6E73] hover:bg-black/5 hover:text-[#1D1D1F]"
+                  >
+                    {showAuthPassword ? (
+                      <EyeOff className="h-4 w-4" aria-hidden="true" />
+                    ) : (
+                      <Eye className="h-4 w-4" aria-hidden="true" />
+                    )}
+                  </button>
+                </div>
+              </div>
+
+              {(authError || lockSecondsLeft > 0) && (
+                <div
+                  role="alert"
+                  className="flex items-start gap-2 rounded-2xl border border-red-200 bg-red-50/90 p-3 text-[13px] text-red-700"
+                >
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+                  <span>
+                    {lockSecondsLeft > 0
+                      ? `Acceso bloqueado temporalmente por seguridad. Reintentá en ${lockSecondsLeft}s.`
+                      : authError}
+                  </span>
+                </div>
+              )}
+
+              <div className="flex gap-2.5 pt-1">
+                <button
+                  type="button"
+                  onClick={() => setAuthModalOpen(false)}
+                  className="min-h-[44px] flex-1 rounded-full border border-black/15 text-[14px] font-medium text-[#1D1D1F] hover:bg-black/5"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="submit"
+                  disabled={lockSecondsLeft > 0 || authBusy}
+                  className="inline-flex min-h-[44px] flex-1 items-center justify-center gap-1.5 rounded-full bg-[#0066CC] text-[14px] font-semibold text-white shadow-sm hover:bg-[#0055B3] disabled:opacity-50"
+                >
+                  <ShieldCheck className="h-4 w-4" aria-hidden="true" />
+                  <span>{authBusy ? 'Verificando...' : 'Desbloquear'}</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Modal 6: Cambiar Clave de Propietario */}
+      {ownerMode && changeKeyOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-md"
+          onClick={() => setChangeKeyOpen(false)}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="change-key-title"
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-md rounded-[32px] border border-white/60 bg-white/90 p-6 shadow-[0_28px_80px_rgba(0,0,0,0.32)] backdrop-blur-2xl sm:p-7"
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="text-[11px] font-semibold uppercase tracking-wider text-[#0066CC]">
+                  Seguridad
+                </p>
+                <h3
+                  id="change-key-title"
+                  className="text-[20px] font-semibold tracking-tight text-[#1D1D1F]"
+                >
+                  Cambiar clave de acceso
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setChangeKeyOpen(false)}
+                aria-label="Cerrar cambio de clave"
+                className="flex h-9 w-9 items-center justify-center rounded-full bg-black/5 text-[#1D1D1F] hover:bg-black/10"
+              >
+                <X className="h-4 w-4" aria-hidden="true" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveNewOwnerKey} className="mt-4 space-y-3.5">
+              <div>
+                <label
+                  htmlFor="new-owner-key"
+                  className="mb-1 block text-[12px] font-semibold text-[#1D1D1F]"
+                >
+                  Nueva clave (mínimo 4 caracteres)
+                </label>
+                <input
+                  id="new-owner-key"
+                  type="password"
+                  autoComplete="new-password"
+                  value={newKeyInput}
+                  onChange={(e) => {
+                    setNewKeyInput(e.target.value);
+                    if (changeKeyError) setChangeKeyError('');
+                  }}
+                  className="min-h-[44px] w-full rounded-2xl border border-black/15 bg-white px-3.5 text-[14px] text-[#1D1D1F] focus:border-[#0066CC] focus:outline-none"
+                />
+              </div>
+
+              <div>
+                <label
+                  htmlFor="confirm-owner-key"
+                  className="mb-1 block text-[12px] font-semibold text-[#1D1D1F]"
+                >
+                  Confirmar nueva clave
+                </label>
+                <input
+                  id="confirm-owner-key"
+                  type="password"
+                  autoComplete="new-password"
+                  value={confirmKeyInput}
+                  onChange={(e) => {
+                    setConfirmKeyInput(e.target.value);
+                    if (changeKeyError) setChangeKeyError('');
+                  }}
+                  className="min-h-[44px] w-full rounded-2xl border border-black/15 bg-white px-3.5 text-[14px] text-[#1D1D1F] focus:border-[#0066CC] focus:outline-none"
+                />
+              </div>
+
+              {changeKeyError && (
+                <p role="alert" className="text-[12px] font-medium text-red-600">
+                  {changeKeyError}
+                </p>
+              )}
+
+              <div className="flex gap-2.5 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setChangeKeyOpen(false)}
+                  className="min-h-[44px] flex-1 rounded-full border border-black/15 text-[14px] font-medium text-[#1D1D1F] hover:bg-black/5"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="submit"
+                  className="min-h-[44px] flex-1 rounded-full bg-[#0066CC] text-[14px] font-semibold text-white hover:bg-[#0055B3]"
+                >
+                  Guardar clave
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}
